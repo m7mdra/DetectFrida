@@ -1,20 +1,21 @@
 #include <jni.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include <malloc.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <elf.h>
 #include <dirent.h>
-#include <ctype.h>
+#include <cctype>
 
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <asm/unistd.h>
 #include <android/log.h>
+#include <exception>
 
 #include "syscall_arch.h"
 #include "syscalls.h"
@@ -47,7 +48,7 @@ typedef struct stExecSection {
 //Include more libs as per your need, but beware of the performance bottleneck especially
 //when the size of the libraries are > few MBs
 static const char *libstocheck[NUM_LIBS] = {"libnative-lib.so", LIBC};
-static execSection *elfSectionArr[NUM_LIBS] = {NULL};
+static execSection *elfSectionArr[NUM_LIBS] = {nullptr};
 
 
 #ifdef _32_BIT
@@ -62,10 +63,10 @@ static inline void parse_proc_maps_to_fetch_path(char **filepaths);
 
 static inline bool fetch_checksum_of_library(const char *filePath, execSection **pTextSection);
 
-static inline void detect_frida_loop(void *pargs);
+[[noreturn]] static inline void *detect_frida_loop(void *pargs);
 
 static inline bool
-scan_executable_segments(char *map, execSection *pTextSection, const char *libraryName);
+scan_executable_segments(char *map, execSection *pElfSectArr, const char *libraryName);
 
 static inline ssize_t read_one_line(int fd, char *buf, unsigned int max_len);
 
@@ -77,22 +78,31 @@ static inline void detect_frida_namedpipe();
 
 static inline void detect_frida_memdiskcompare();
 
+void throwJavaException(JNIEnv *pEnv, const char *what);
+
 //Upon loading the library, this function annotated as constructor starts executing
 __attribute__((constructor))
 void detectfrida() {
+    try {
 
-    char *filePaths[NUM_LIBS];
 
-    parse_proc_maps_to_fetch_path(filePaths);
-    __android_log_print(ANDROID_LOG_VERBOSE, APPNAME, "Libc[%x][%x][%x][%x][%x][%x]", __NR_openat,
-                        __NR_lseek, __NR_read, __NR_close, __NR_readlinkat, __NR_nanosleep);
-    for (int i = 0; i < NUM_LIBS; i++) {
-        fetch_checksum_of_library(filePaths[i], &elfSectionArr[i]);
-        if (filePaths[i] != NULL)
-            free(filePaths[i]);
+        char *filePaths[NUM_LIBS];
+
+        parse_proc_maps_to_fetch_path(filePaths);
+        __android_log_print(ANDROID_LOG_VERBOSE, APPNAME, "Libc[%x][%x][%x][%x][%x][%x]",
+                            __NR_openat,
+                            __NR_lseek, __NR_read, __NR_close, __NR_readlinkat, __NR_nanosleep);
+        for (int i = 0; i < NUM_LIBS; i++) {
+            fetch_checksum_of_library(filePaths[i], &elfSectionArr[i]);
+            if (filePaths[i] != nullptr)
+                free(filePaths[i]);
+        }
+        pthread_t t;
+        pthread_create(&t, nullptr, detect_frida_loop, nullptr);
+    } catch (std::exception &exception) {
+        __android_log_print(ANDROID_LOG_ERROR,APPNAME,"%s", exception.what());
+        throw exception;
     }
-    pthread_t t;
-    pthread_create(&t, NULL, (void *) detect_frida_loop, NULL);
 
 }
 
@@ -105,14 +115,14 @@ static inline void parse_proc_maps_to_fetch_path(char **filepaths) {
 
         while ((read_one_line(fd, map, MAX_LINE)) > 0) {
             for (int i = 0; i < NUM_LIBS; i++) {
-                if (my_strstr(map, libstocheck[i]) != NULL) {
+                if (my_strstr(map, libstocheck[i]) != nullptr) {
                     char tmp[MAX_LENGTH] = "";
                     char path[MAX_LENGTH] = "";
                     char buf[5] = "";
                     sscanf(map, "%s %s %s %s %s %s", tmp, buf, tmp, tmp, tmp, path);
                     if (buf[2] == 'x') {
                         size_t size = my_strlen(path) + 1;
-                        filepaths[i] = malloc(size);
+                        filepaths[i] = static_cast<char *>(malloc(size));
                         my_strlcpy(filepaths[i], path, size);
                         counter++;
                     }
@@ -134,7 +144,7 @@ static inline bool fetch_checksum_of_library(const char *filePath, execSection *
     int execSectionCount = 0;
     fd = my_openat(AT_FDCWD, filePath, O_RDONLY | O_CLOEXEC, 0);
     if (fd < 0) {
-        return NULL;
+        return false;
     }
 
     my_read(fd, &ehdr, sizeof(Elf_Ehdr));
@@ -168,13 +178,13 @@ static inline bool fetch_checksum_of_library(const char *filePath, execSection *
         return false;
     }
     //This memory is not released as the checksum is checked in a thread
-    *pTextSection = malloc(sizeof(execSection));
+    *pTextSection = static_cast<execSection *>(malloc(sizeof(execSection)));
 
     (*pTextSection)->execSectionCount = execSectionCount;
     (*pTextSection)->startAddrinMem = 0;
     for (int i = 0; i < execSectionCount; i++) {
         my_lseek(fd, offset[i], SEEK_SET);
-        uint8_t *buffer = malloc(memsize[i] * sizeof(uint8_t));
+        auto *buffer = (uint8_t *) malloc(memsize[i] * sizeof(uint8_t));
         my_read(fd, buffer, memsize[i]);
         (*pTextSection)->offset[i] = offset[i];
         (*pTextSection)->memsize[i] = memsize[i];
@@ -190,9 +200,9 @@ static inline bool fetch_checksum_of_library(const char *filePath, execSection *
 }
 
 
-void detect_frida_loop(void *pargs) {
+[[noreturn]] void *detect_frida_loop(void *pargs) {
 
-    struct timespec timereq;
+    struct timespec timereq{};
     timereq.tv_sec = 5; //Changing to 5 seconds from 1 second
     timereq.tv_nsec = 0;
 
@@ -203,7 +213,7 @@ void detect_frida_loop(void *pargs) {
         detect_frida_memdiskcompare();
 
 
-        my_nanosleep(&timereq, NULL);
+        my_nanosleep(&timereq, nullptr);
 
     }
 }
@@ -221,7 +231,7 @@ scan_executable_segments(char *map, execSection *pElfSectArr, const char *librar
 
     if (buf[2] == 'x') {
         if (buf[0] == 'r') {
-            uint8_t *buffer = NULL;
+            uint8_t *buffer = nullptr;
 
             buffer = (uint8_t *) start;
             for (int i = 0; i < pElfSectArr->execSectionCount; i++) {
@@ -244,6 +254,8 @@ scan_executable_segments(char *map, execSection *pElfSectArr, const char *librar
                                         "Executable Section Manipulated, "
                                         "maybe due to Frida or other hooking framework."
                                         "Act Now!!!");
+                    throw -1;
+
                 }
             }
 
@@ -314,7 +326,7 @@ static inline ssize_t read_one_line(int fd, char *buf, unsigned int max_len) {
 __attribute__((always_inline))
 static inline unsigned long checksum(void *buffer, size_t len) {
     unsigned long seed = 0;
-    uint8_t *buf = (uint8_t *) buffer;
+    uint8_t *buf = static_cast<uint8_t *>(buffer);
     size_t i;
     for (i = 0; i < len; ++i)
         seed += (unsigned long) (*buf++);
@@ -326,9 +338,9 @@ static inline void detect_frida_threads() {
 
     DIR *dir = opendir(PROC_TASK);
 
-    if (dir != NULL) {
-        struct dirent *entry = NULL;
-        while ((entry = readdir(dir)) != NULL) {
+    if (dir != nullptr) {
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
             char filePath[MAX_LENGTH] = "";
 
             if (0 == my_strcmp(entry->d_name, ".") || 0 == my_strcmp(entry->d_name, "..")) {
@@ -347,6 +359,9 @@ static inline void detect_frida_threads() {
                     //int ret = my_tgkill(getpid(), tid, SIGSTOP);
                     __android_log_print(ANDROID_LOG_WARN, APPNAME,
                                         "Frida specific thread found. Act now!!!");
+                    my_close(fd);
+                    throw -1;
+
                 }
                 my_close(fd);
             }
@@ -362,10 +377,10 @@ __attribute__((always_inline))
 static inline void detect_frida_namedpipe() {
 
     DIR *dir = opendir(PROC_FD);
-    if (dir != NULL) {
-        struct dirent *entry = NULL;
-        while ((entry = readdir(dir)) != NULL) {
-            struct stat filestat;
+    if (dir != nullptr) {
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            struct stat filestat{};
             char buf[MAX_LENGTH] = "";
             char filePath[MAX_LENGTH] = "";
             snprintf(filePath, sizeof(filePath), "/proc/self/fd/%s", entry->d_name);
@@ -375,9 +390,13 @@ static inline void detect_frida_namedpipe() {
             if ((filestat.st_mode & S_IFMT) == S_IFLNK) {
                 //TODO: Another way is to check if filepath belongs to a path not related to system or the app
                 my_readlinkat(AT_FDCWD, filePath, buf, MAX_LENGTH);
-                if (NULL != my_strstr(buf, FRIDA_NAMEDPIPE_LINJECTOR)) {
+                if (nullptr != my_strstr(buf, FRIDA_NAMEDPIPE_LINJECTOR)) {
                     __android_log_print(ANDROID_LOG_WARN, APPNAME,
                                         "Frida specific named pipe found. Act now!!!");
+                    closedir(dir);
+
+                    throw -1;
+
                 }
             }
 
@@ -395,8 +414,8 @@ static inline void detect_frida_memdiskcompare() {
 
         while ((read_one_line(fd, map, MAX_LINE)) > 0) {
             for (int i = 0; i < NUM_LIBS; i++) {
-                if (my_strstr(map, libstocheck[i]) != NULL) {
-                    if (true == scan_executable_segments(map, elfSectionArr[i], libstocheck[i])) {
+                if (my_strstr(map, libstocheck[i]) != nullptr) {
+                    if (scan_executable_segments(map, elfSectionArr[i], libstocheck[i])) {
                         break;
                     }
                 }
@@ -411,3 +430,23 @@ static inline void detect_frida_memdiskcompare() {
 
 }
 
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_darvin_security_DetectFrida_run(JNIEnv *env, jclass thiz) {
+    try {
+
+        detectfrida();
+    } catch (std::exception &exception) {
+        __android_log_print(ANDROID_LOG_VERBOSE, APPNAME,
+                            "Something not right, will crash the ship");
+        throwJavaException(env, exception.what());
+    }
+
+}
+
+void throwJavaException(JNIEnv *pEnv, const char *what) {
+
+    jclass c = pEnv->FindClass("java/lang/NullPointerException");
+    pEnv->ThrowNew(c, "");
+}
